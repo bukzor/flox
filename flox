@@ -1,0 +1,80 @@
+#!/bin/bash
+## usage:  echo buildbot28 bb{90..96}-useast1atestopia | time ssh-each hostname -f
+# the wrapped command is quoted so that it survives the shell inside ssh
+set -euo pipefail
+
+# we create a shared lock to prevent interleaving output
+tmpdir="${TMPDIR:-/tmp}/$USER/ssh-each"
+mkdir -p "$tmpdir"
+
+# lock to only allow one subprocess to print to stdout
+lock=$tmpdir/$$.lock
+exec 200>"$lock"
+rm "$lock"
+
+# lock to only allow one subprocess to bootstrap venv-update
+lock=$tmpdir/$$.lock
+exec 201>"$lock"
+rm "$lock"
+
+
+xargs -n1 | xargs --replace -P50 bash -c '
+    set -euo pipefail
+    (
+        # fd 5 points at the original stdout
+        exec 5>&1
+
+        # fd 4 points at our line-counting pipeline
+        exec 4> >(
+            if [ "$(tee /dev/fd/5 | wc -l)" = 0 ]; then
+                echo "(no output)"
+            fi
+        )
+
+        # stdout and stderr point at fd 4
+        exec 1>&4
+        exec 2>&4
+
+        echo -n "{}: "
+
+        ### bootstrap venv-update
+        flock -x 201
+        venv_update=$PWD/bin/venv-update
+        if [ -x $venv_update ]; then
+            : vendored to project
+        elif [ -e .flox/venv-update.url ]; then
+            : pinned by config
+            if [ -x $venv_update && $venv_update -nt .flox/venv-update.url ]; then
+                : all is swell
+            else
+                mkdir -p $(dirname $venv_update)
+                curl -L --fail $(cat .flox/venv-update.url) > $venv_update
+                chmod 755 $venv_update
+            fi
+        elif [ -x venv-update ]; then
+            : installed at system level
+            echo WARNING: venv-update is unpinned -- using system installation
+            venv_update=venv-update
+        else 
+            : reasonable default -- install per documentation at http://venv-update.rtfd.org/#installation
+            echo WARNING: venv-update is unpinned -- downloading from github
+            curl https://yelp.github.io/venv-update/install.txt | bash
+        fi
+        flock -u 201
+
+        set -x
+        mkdir -p .flox
+        $venv_update \
+            venv= -p {} .flox/{} \
+            install= -r requirements.d/dev.txt
+        set +ux
+        source .flox/{}/bin/activate
+        set -ux
+        if [ -e ./.flox/run-tests ]; then
+            chmod 755 ./.flox/run-tests
+            ./.flox/run-tests
+        else
+            py.test tests
+        fi
+    ) | flock -x /dev/fd/200 cat
+'
